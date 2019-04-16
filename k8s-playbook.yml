@@ -1,0 +1,179 @@
+- hosts: all
+  become: yes
+  tasks:
+  - name: Update Cache
+    apt:
+      update_cache: yes
+
+  - name: Remove old-docker
+    apt:
+      name: "{{  packages  }}"
+      state: absent
+    vars:
+      packages:
+      - docker
+      - docker-engine
+      - docker.io
+      - containerd
+      - runc
+
+  - name: Upgrade Installation
+    become: true
+    apt:
+      upgrade: yes
+      update_cache: yes
+
+  - name: Preparing to install Docker
+    apt:
+      name: "{{ packages }}"
+      state: present
+    vars:
+      packages:
+      - apt-transport-https
+      - ca-certificates
+      - curl
+      - gnupg2
+      - software-properties-common
+
+  - name: Add an Apt signing key, will not download if present
+    apt_key:
+      url: https://download.docker.com/linux/ubuntu/gpg
+      state: present
+
+  - name: Add Docker stable Repository
+    apt_repository:
+      repo: deb [arch=amd64] https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable
+      state: present
+
+  - name: Add apt signing key for kubernetes
+    apt_key:
+      url: https://packages.cloud.google.com/apt/doc/apt-key.gpg
+      state: present
+
+  - name: Add k8s repo
+    apt_repository:
+      repo: deb http://apt.kubernetes.io/ kubernetes-xenial main
+      state: present
+      filename: kubernetes
+
+  - name: Update Cache
+    apt:
+      update_cache: yes
+
+  - name: Install Docker
+    apt:
+      name: "{{ packages }}"
+      state: present
+    vars:
+      packages:
+      - docker-ce
+      - docker-ce-cli
+      - containerd.io
+
+  - name: Install Docker Compose
+    apt:
+      name: "{{ packages }}"
+      state: present
+    vars:
+      packages:
+      - docker-compose
+  
+  - name: Remove swapfile from /etc/fstab
+    mount:
+      name: swap
+      fstype: swap
+      state: absent
+  
+  - name: Disable swap
+    command: swapoff -a
+    when: ansible_swaptotal_mb > 0
+
+  - name: Install kubeadm, kubelet
+    apt:
+      name: "{{ packages }}"
+      state: present
+    vars:
+      packages:
+      - kubeadm
+      - kubelet
+
+- hosts: master
+  become: yes
+  tasks:
+  - name: Install kubectl
+    apt:
+      name: "{{ packages }}"
+      state: present
+    vars:
+      packages:
+      - kubectl
+
+  - name: initialize the cluster
+    shell: kubeadm init --pod-network-cidr=172.16.0.0/16 >> cluster_initialized.txt
+    args:
+      chdir: $HOME
+      creates: cluster_initialized.txt
+
+  - name: create .kube directory
+    become: yes
+    become_user: k8s
+    file:
+      path: $HOME/.kube
+      state: directory
+      mode: 0755
+
+- hosts: master
+  become: yes
+  tasks:
+  - name: copy admin.conf to user's kube config
+    copy:
+      src: /etc/kubernetes/admin.conf
+      dest: /home/k8s/.kube/config
+      remote_src: yes
+      owner: k8s
+
+  - name: install Pod network
+    become: yes
+    become_user: k8s
+    shell: KUBECONFIG=~/.kube/config/admin.conf kubectl apply -f https://raw.githubusercontent.com/cloudnativelabs/kube-router/master/daemonset/kubeadm-kuberouter-all-features.yaml >> pod_network_setup.txt
+    args:
+      chdir: $HOME
+      creates: pod_network_setup.txt
+
+- hosts: master
+  become: yes
+  #gather_facts: false
+  tasks:
+    - name: get join command
+      shell: kubeadm token create --print-join-command
+      register: join_command_raw
+
+    - name: set join command
+      set_fact:
+        join_command: "{{ join_command_raw.stdout_lines[0] }}"
+
+- hosts: slave
+  become: yes
+  gather_facts: yes
+  tasks:
+    - name: TCP port 6443 on master is reachable from worker
+      wait_for: "host={{ hostvars['master0']['ansible_default_ipv4']['address'] }} port=6443 timeout=1"
+
+    - name: join cluster
+      shell: "{{ hostvars['master0'].join_command }} >> node_joined.txt"
+      args:
+        chdir: $HOME
+        creates: node_joined.txt
+
+- hosts: master
+  tasks:
+  - name:  make master slave
+    shell: kubectl taint nodes --all node-role.kubernetes.io/master-
+
+- hosts: master
+  tasks:
+  - name: Installing k8s Dashboard
+    shell: kubectl apply -f https://raw.githubusercontent.com/kubernetes/dashboard/v1.10.1/src/deploy/recommended/kubernetes-dashboard.yaml
+  
+  - name: Install Weave
+    shell: kubectl apply -f "https://cloud.weave.works/k8s/scope.yaml?k8s-version=$(kubectl version | base64 | tr -d '\n')"
